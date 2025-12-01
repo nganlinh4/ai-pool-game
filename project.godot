@@ -10,16 +10,17 @@ config_version=5
 
 [application]
 
-config/name="AI Pool Game 2D Redux"
-config/version="1.1.0"
-run/main_scene="uid://dqndahqnrmd8"
-config/features=PackedStringArray("4.5", "Mobile")
+config/name="AI Pool Game 3D"
+config/version="2.0.0"
+run/main_scene="res://PoolGame3D.tscn"
+config/features=PackedStringArray("4.5")
 
 [display]
 
 window/size/viewport_width=1280
 window/size/viewport_height=720
 window/stretch/mode="canvas_items"
+viewport/msaa_3d=2
 
 [input]
 
@@ -31,10 +32,14 @@ shoot={
 
 [physics]
 
+common/physics_ticks_per_second=120
+3d/physics_engine="Jolt Physics"
 2d/default_gravity=0.0
-2d/default_linear_damp=0.5
+2d/default_linear_damp=0.0
 
 [rendering]
 
+textures/vram_compression/import_etc2_astc=true
 anti_aliasing/quality/msaa_2d=2
+environment/defaults/default_clear_color=Color(0.1, 0.1, 0.1, 1)
 anti_aliasing/quality/screen_space_aa=1
