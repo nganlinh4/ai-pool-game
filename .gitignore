@@ -1,0 +1,22 @@
+# Godot
+.godot/
+*.import
+*.translation
+*.scn
+*.tscn
+*.gd.rpc_cache
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build
+export/
+build/
+dist/
