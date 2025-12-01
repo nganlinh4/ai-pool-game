@@ -11,8 +11,8 @@ var main_color: Color = Color.WHITE
 var is_stopped: bool = true
 const STOP_THRESHOLD: float = 5.0 
 
-# Signals
-signal collided(intensity)
+# Signals: Now includes Position for particles
+signal collided(intensity, position)
 
 # Visuals
 var _visual_node: Node2D
@@ -64,17 +64,19 @@ func _physics_process(_delta):
 		_visual_node.rotation += speed * _delta * 0.05
 
 func _integrate_forces(state):
-	# Detect collisions for Audio
+	# Detect collisions for Audio & Particles
 	if state.get_contact_count() > 0:
-		# Sum up impact forces (approximate via velocity difference)
-		# Note: In a real engine we'd look at impulse, but velocity is a decent proxy here
 		var my_vel = state.linear_velocity
 		for i in range(state.get_contact_count()):
 			var col_vel = state.get_contact_collider_velocity_at_position(i)
-			# Impact intensity roughly proportional to relative velocity
 			var impact = (my_vel - col_vel).length()
-			if impact > 20.0: # Minimum sound threshold
-				emit_signal("collided", impact)
+			
+			if impact > 20.0:
+				# Get collision position in Global Space
+				# local_position is relative to body origin
+				var local_pos = state.get_contact_local_position(i)
+				var global_pos = global_transform * local_pos
+				emit_signal("collided", impact, global_pos)
 
 func stop_ball():
 	is_stopped = true

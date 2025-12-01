@@ -4,32 +4,33 @@ extends Node2D
 const TABLE_W = 800.0
 const TABLE_H = 400.0
 const BALL_R = 10.0
-const POCKET_R = 25.0 # Slightly larger for better gameplay feel
+const POCKET_R = 25.0
 const RAIL_WIDTH = 30.0
 const MAX_POWER = 2500.0
 const MAX_DRAG_DIST = 250.0
 
 # --- Colors ---
 const COL_FELT = Color(0.0, 0.5, 0.35)
+const COL_FELT_DARK = Color(0.0, 0.45, 0.32)
 const COL_WOOD = Color(0.35, 0.2, 0.1)
+const COL_WOOD_DARK = Color(0.25, 0.15, 0.05)
 const BALL_COLORS = [
 	Color.YELLOW, Color.BLUE, Color.RED, Color.PURPLE, 
 	Color.ORANGE, Color.GREEN, Color.MAROON
 ]
 
 # --- State Machine ---
-enum State { AIMING, SHOOTING, WAITING_FOR_STOP, PLACING_CUE, GAME_OVER }
-var current_state = State.AIMING
+enum State { MENU, AIMING, SHOOTING, WAITING_FOR_STOP, PLACING_CUE, GAME_OVER }
+var current_state = State.MENU
 
 enum Player { HUMAN, AI }
 var turn_manager = Player.HUMAN
+var game_mode = Player.AI # Who is the opponent?
 
 # --- Rules State ---
-# 0 = Open, 1 = Solids (1-7), 2 = Stripes (9-15)
 var player_group: int = 0 
 var ai_group: int = 0
 var balls_potted_this_turn: Array = []
-var first_hit_ball_type: int = -1
 var foul_committed: bool = false
 var foul_reason: String = ""
 
@@ -38,77 +39,61 @@ var cue_ball: RigidBody2D
 var balls_on_table: Array = []
 var walls: StaticBody2D
 var pockets: Array = []
+var particle_container: Node2D 
+
+# UI Nodes
 var ui_layer: CanvasLayer
+var menu_control: Control
+var hud_control: Control
 var status_label: Label
 var group_label: Label
 
-# --- Input ---
+# Camera
+var camera: Camera2D
+var shake_strength: float = 0.0
+
+# --- Input & Aiming ---
 var is_dragging: bool = false
 var drag_start_pos: Vector2
 var aim_vector: Vector2
+var ghost_ball_pos: Vector2 = Vector2.INF
+var ghost_target_path: Vector2 = Vector2.ZERO
 
 # --- Audio System ---
 var audio_player: AudioStreamPlayer
 var audio_playback: AudioStreamGeneratorPlayback
 const SAMPLE_HZ = 44100.0
-const PULSE_HZ = 400.0
 
 func _ready():
 	randomize()
 	_setup_audio()
-	_setup_visuals_and_ui()
+	_setup_camera()
+	_setup_ui_system()
 	_setup_physics_world()
-	reset_game()
+	
+	particle_container = Node2D.new()
+	add_child(particle_container)
+	
+	# Start in Menu
+	_set_state(State.MENU)
 
 # --------------------------------------------------------------------------
-#   AUDIO ENGINE (Procedural)
+#   GAME LOOP & PROCESS
 # --------------------------------------------------------------------------
-func _setup_audio():
-	audio_player = AudioStreamPlayer.new()
-	var generator = AudioStreamGenerator.new()
-	generator.mix_rate = SAMPLE_HZ
-	generator.buffer_length = 0.1 # Short buffer for low latency
-	audio_player.stream = generator
-	add_child(audio_player)
-	audio_player.play()
-	audio_playback = audio_player.get_stream_playback()
-
-func play_clack_sound(intensity: float):
-	if not audio_playback: return
-	
-	# Generate a short noise burst + sine wave decay
-	# Map intensity (20..1000) to volume (0.1..1.0)
-	var volume = clamp(intensity / 800.0, 0.1, 1.0)
-	var frames_to_push = int(SAMPLE_HZ * 0.05) # 50ms sound
-	
-	if audio_playback.get_frames_available() < frames_to_push: return
-	
-	var buffer = PackedVector2Array()
-	buffer.resize(frames_to_push)
-	
-	for i in range(frames_to_push):
-		var t = float(i) / frames_to_push
-		var decay = exp(-10.0 * t) # Exponential decay
-		var sine = sin(t * 50.0) # Low thud
-		var noise = randf_range(-1.0, 1.0) # Crack
-		var sample = (sine * 0.5 + noise * 0.5) * decay * volume
-		buffer[i] = Vector2(sample, sample)
-		
-	audio_playback.push_buffer(buffer)
-
-# --------------------------------------------------------------------------
-#   GAME LOOP
-# --------------------------------------------------------------------------
-func _process(_delta):
+func _process(delta):
 	queue_redraw()
+	_process_camera_shake(delta)
 	
 	match current_state:
+		State.MENU:
+			pass # Waiting for UI input
+			
 		State.AIMING:
 			if turn_manager == Player.HUMAN:
 				_handle_human_aiming()
-			else:
+			elif game_mode == Player.AI:
 				_run_ai_turn()
-		
+				
 		State.PLACING_CUE:
 			_handle_cue_placement()
 
@@ -116,24 +101,79 @@ func _process(_delta):
 			if _are_balls_stopped():
 				_end_turn_logic()
 
+func _set_state(new_state):
+	current_state = new_state
+	# UI Visibility Toggle
+	menu_control.visible = (new_state == State.MENU)
+	hud_control.visible = (new_state != State.MENU)
+	
+	if new_state == State.MENU:
+		# Clear table visual
+		_clear_table_entities()
+	
+	if new_state == State.AIMING:
+		update_status("Your Turn" if turn_manager == Player.HUMAN else "Opponent Thinking...")
+
+# --------------------------------------------------------------------------
+#   CAMERA SHAKE
+# --------------------------------------------------------------------------
+func _setup_camera():
+	camera = Camera2D.new()
+	camera.position = Vector2(TABLE_W/2, TABLE_H/2)
+	add_child(camera)
+
+func apply_shake(intensity: float):
+	# Map intensity (0-2000) to shake amount (0-15 pixels)
+	shake_strength = clamp(intensity * 0.015, 0.0, 20.0)
+
+func _process_camera_shake(delta):
+	if shake_strength > 0:
+		shake_strength = lerp(shake_strength, 0.0, 10.0 * delta)
+		var offset = Vector2(randf_range(-1, 1), randf_range(-1, 1)) * shake_strength
+		camera.offset = offset
+	else:
+		camera.offset = Vector2.ZERO
+
+# --------------------------------------------------------------------------
+#   INPUT & CONTROLS
+# --------------------------------------------------------------------------
 func _handle_human_aiming():
 	if not is_instance_valid(cue_ball): return
-	# Mouse drag logic handled in _unhandled_input and _draw
-	pass
+	
+	# Ghost Ball Logic
+	ghost_ball_pos = Vector2.INF
+	ghost_target_path = Vector2.ZERO
+	
+	if is_dragging and aim_vector.length() > 10.0:
+		var space = get_world_2d().direct_space_state
+		var dir = aim_vector.normalized()
+		var start = cue_ball.position
+		var end = start + dir * 2000.0
+		
+		var query = PhysicsRayQueryParameters2D.create(start, end)
+		query.exclude = [cue_ball.get_rid()]
+		var result = space.intersect_ray(query)
+		
+		if not result.is_empty():
+			var collider = result.collider
+			if collider is PoolBall:
+				# Ghost Ball Position: Hit Position + (Hit Normal * 2 Radius)
+				# Note: result.normal points OUT from the object ball.
+				ghost_ball_pos = collider.position + (result.normal * (BALL_R * 2.0))
+				# Target Trajectory: Opposite of Hit Normal
+				ghost_target_path = -result.normal * 150.0
 
 func _handle_cue_placement():
 	if not is_instance_valid(cue_ball): return
 	cue_ball.linear_velocity = Vector2.ZERO
 	cue_ball.position = get_global_mouse_position()
 	
-	# Clamp to table
 	var margin = BALL_R + RAIL_WIDTH
 	cue_ball.position.x = clamp(cue_ball.position.x, margin, TABLE_W - margin)
 	cue_ball.position.y = clamp(cue_ball.position.y, margin, TABLE_H - margin)
 	
 	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
-		# Place it
-		current_state = State.AIMING
+		_set_state(State.AIMING)
 		update_status("Placed. Drag to shoot.")
 
 func _unhandled_input(event):
@@ -154,7 +194,7 @@ func _unhandled_input(event):
 		aim_vector = drag_vec
 
 func _execute_shot(vector: Vector2):
-	if vector.length() < 10.0: return # Ignore tiny drags
+	if vector.length() < 10.0: return 
 	
 	var power_ratio = vector.length() / MAX_DRAG_DIST
 	var impulse = vector.normalized() * (power_ratio * MAX_POWER)
@@ -162,15 +202,15 @@ func _execute_shot(vector: Vector2):
 	cue_ball.sleeping = false
 	cue_ball.apply_central_impulse(impulse)
 	
-	play_clack_sound(MAX_POWER * power_ratio * 0.5) # Cue hit sound
+	play_clack_sound(MAX_POWER * power_ratio * 0.6)
+	apply_shake(MAX_POWER * power_ratio)
+	spawn_particles(100.0, cue_ball.position)
 	
-	# Reset Turn Flags
 	balls_potted_this_turn.clear()
-	first_hit_ball_type = -1
 	foul_committed = false
 	foul_reason = ""
 	
-	current_state = State.WAITING_FOR_STOP
+	_set_state(State.WAITING_FOR_STOP)
 	update_status("Balls Rolling...")
 
 # --------------------------------------------------------------------------
@@ -178,372 +218,419 @@ func _execute_shot(vector: Vector2):
 # --------------------------------------------------------------------------
 func _run_ai_turn():
 	if not is_instance_valid(cue_ball): return
-	
-	current_state = State.SHOOTING # Lock state
+	_set_state(State.SHOOTING)
 	update_status("AI is thinking...")
 	
-	# Delay for realism
 	await get_tree().create_timer(1.0).timeout
 	
-	# 1. Identify Valid Targets
+	# Simple AI Implementation
 	var targets = []
 	for b in balls_on_table:
 		if b == cue_ball: continue
-		if _is_ball_legal_target(b):
-			targets.append(b)
+		if _is_ball_legal_target(b): targets.append(b)
 	
-	# If no legal targets, just hit anything (or 8 ball if that's all that's left)
-	if targets.is_empty():
-		for b in balls_on_table:
-			if b != cue_ball: targets.append(b)
+	if targets.is_empty(): # Fallback
+		for b in balls_on_table: if b != cue_ball: targets.append(b)
 	
-	# 2. Evaluate Best Shot
-	var best_shot_vec = Vector2.ZERO
-	var best_score = -1000.0
+	var best_shot = Vector2.ZERO
+	var best_score = -9999.0
 	
 	for target in targets:
 		for pocket in pockets:
-			var pocket_pos = pocket.position
+			# Raycast Check Target -> Pocket
+			if not _raycast_clear(target.position, pocket.position, [target, cue_ball]): continue
 			
-			# Vector from Target -> Pocket
-			var to_pocket = pocket_pos - target.position
-			
-			# Is path to pocket clear?
-			if not _raycast_check(target.position, pocket_pos, [target, cue_ball]):
-				continue # Blocked
-				
-			# Calculate "Ghost Ball" position (where Cue must hit Target)
+			var to_pocket = pocket.position - target.position
 			var aim_dir = to_pocket.normalized()
 			var ghost_pos = target.position - (aim_dir * (BALL_R * 2.0))
 			
-			# Vector from Cue -> Ghost Ball
-			var shot_vec = ghost_pos - cue_ball.position
+			# Raycast Check Cue -> Ghost
+			if not _raycast_clear(cue_ball.position, ghost_pos, [cue_ball, target]): continue
 			
-			# Is path to Ghost Ball clear?
-			if not _raycast_check(cue_ball.position, ghost_pos, [cue_ball, target]):
-				continue
-				
-			# Score this shot
-			var dist_score = -shot_vec.length() # Closer is better
-			var angle_cut = abs(shot_vec.angle_to(aim_dir)) # Straighter is better
-			var score = dist_score - (angle_cut * 500.0)
+			var shot_vec = ghost_pos - cue_ball.position
+			var score = -shot_vec.length() - (abs(shot_vec.angle_to(aim_dir)) * 600.0)
 			
 			if score > best_score:
 				best_score = score
-				best_shot_vec = shot_vec
+				best_shot = shot_vec
 	
-	# 3. Execute
-	if best_shot_vec == Vector2.ZERO:
-		# AI is stuck, shoot randomly
-		best_shot_vec = Vector2(randf()-0.5, randf()-0.5) * 100.0
+	if best_shot == Vector2.ZERO:
+		best_shot = Vector2(randf()-0.5, randf()-0.5) * 100.0
 	else:
-		# Add a little noise for "human-like" error
-		best_shot_vec = best_shot_vec.rotated(randf_range(-0.02, 0.02))
-		# Normalize for power calc
-		if best_shot_vec.length() > MAX_DRAG_DIST:
-			best_shot_vec = best_shot_vec.normalized() * MAX_DRAG_DIST
-		else:
-			# Ensure enough power to reach
-			best_shot_vec = best_shot_vec.normalized() * (best_shot_vec.length() + 200.0)
-			if best_shot_vec.length() > MAX_DRAG_DIST:
-				best_shot_vec = best_shot_vec.normalized() * MAX_DRAG_DIST
-
-	_execute_shot(best_shot_vec)
-
-func _is_ball_legal_target(ball) -> bool:
-	if ai_group == 0: return ball.ball_type != PoolBall.BallType.EIGHT # Can hit anything except 8
-	if ai_group == 1: return ball.ball_type == PoolBall.BallType.SOLID
-	if ai_group == 2: return ball.ball_type == PoolBall.BallType.STRIPE
+		# Add AI Error/Noise
+		best_shot = best_shot.rotated(randf_range(-0.02, 0.02))
+		var pwr = best_shot.length() + 250.0
+		best_shot = best_shot.normalized() * min(pwr, MAX_DRAG_DIST)
 	
-	# If we are here, we might be on the 8-ball
-	var my_balls_left = 0
-	for b in balls_on_table:
-		if (ai_group == 1 and b.ball_type == PoolBall.BallType.SOLID) or \
-		   (ai_group == 2 and b.ball_type == PoolBall.BallType.STRIPE):
-			my_balls_left += 1
-	
-	if my_balls_left == 0:
-		return ball.ball_type == PoolBall.BallType.EIGHT
-	return false
+	_execute_shot(best_shot)
 
-func _raycast_check(from: Vector2, to: Vector2, exclude: Array) -> bool:
-	var space_state = get_world_2d().direct_space_state
+func _raycast_clear(from, to, exclude):
+	var space = get_world_2d().direct_space_state
 	var query = PhysicsRayQueryParameters2D.create(from, to)
-	var rid_exclude = []
-	for obj in exclude:
-		if is_instance_valid(obj): rid_exclude.append(obj.get_rid())
-	query.exclude = rid_exclude
-	var result = space_state.intersect_ray(query)
-	return result.is_empty()
+	var rids = []
+	for x in exclude: if is_instance_valid(x): rids.append(x.get_rid())
+	query.exclude = rids
+	return space.intersect_ray(query).is_empty()
+
+func _is_ball_legal_target(ball):
+	# Simplified 8-ball logic
+	if ai_group == 0: return ball.ball_type != PoolBall.BallType.EIGHT
+	var target_type = PoolBall.BallType.SOLID if ai_group == 1 else PoolBall.BallType.STRIPE
+	
+	var has_balls = false
+	for b in balls_on_table:
+		if b.ball_type == target_type: has_balls = true
+	
+	return ball.ball_type == target_type if has_balls else ball.ball_type == PoolBall.BallType.EIGHT
 
 # --------------------------------------------------------------------------
 #   RULES ENGINE
 # --------------------------------------------------------------------------
-func _on_ball_collision_report(intensity):
+func _on_ball_collision(intensity, pos):
 	play_clack_sound(intensity)
+	if intensity > 400:
+		spawn_particles(intensity, pos)
+		apply_shake(intensity * 0.5)
 
 func _on_pocket_ball(ball):
-	play_clack_sound(500.0) # Pot sound
+	play_clack_sound(600.0)
+	apply_shake(200.0)
 	
 	if ball == cue_ball:
 		foul_committed = true
 		foul_reason = "Scratch!"
-		# Cue ball respawn handled in end logic
 	else:
 		balls_potted_this_turn.append(ball)
 		balls_on_table.erase(ball)
 		ball.queue_free()
 
 func _end_turn_logic():
-	# 1. Check Win/Loss (8-Ball)
-	var eight_potted = false
+	# Win/Loss Check
+	var eight = false
 	for b in balls_potted_this_turn:
-		if is_instance_valid(b) and b.ball_type == PoolBall.BallType.EIGHT:
-			eight_potted = true
-			break
+		if is_instance_valid(b) and b.ball_type == PoolBall.BallType.EIGHT: eight = true
 	
-	if eight_potted:
-		if foul_committed:
-			_game_over("LOSS! 8-Ball Foul.")
-		else:
-			# Did we clear our group?
-			var my_group = player_group if turn_manager == Player.HUMAN else ai_group
-			var my_balls_remain = false
-			# (Simplified check: assume if we shot at 8, we cleared others. 
-			# In real rules we check strictly, but this suffices for now)
-			_game_over("WINNER!")
+	if eight:
+		if foul_committed: _game_over("LOSS! 8-Ball Foul.")
+		else: _game_over("WINNER!")
 		return
 
-	# 2. Check Faults
-	if not is_instance_valid(cue_ball):
-		foul_committed = true # Scratch
+	if not is_instance_valid(cue_ball): foul_committed = true
 	
-	# 3. Assign Groups (Open Table)
-	if player_group == 0 and not foul_committed and balls_potted_this_turn.size() > 0:
+	# Group Assignment
+	if player_group == 0 and not foul_committed and not balls_potted_this_turn.is_empty():
 		var first = balls_potted_this_turn[0]
 		if is_instance_valid(first):
-			if first.ball_type == PoolBall.BallType.SOLID:
-				if turn_manager == Player.HUMAN:
-					player_group = 1; ai_group = 2
-				else:
-					ai_group = 1; player_group = 2
-			elif first.ball_type == PoolBall.BallType.STRIPE:
-				if turn_manager == Player.HUMAN:
-					player_group = 2; ai_group = 1
-				else:
-					ai_group = 2; player_group = 1
+			var is_solid = (first.ball_type == PoolBall.BallType.SOLID)
+			# If Human shot, assign what they hit
+			if turn_manager == Player.HUMAN:
+				player_group = 1 if is_solid else 2
+				ai_group = 2 if is_solid else 1
+			else:
+				ai_group = 1 if is_solid else 2
+				player_group = 2 if is_solid else 1
 			_update_group_ui()
 
-	# 4. Turn Switching Logic
-	var turn_continues = false
-	if not foul_committed and balls_potted_this_turn.size() > 0:
-		# Check if we potted our OWN ball
-		var potted_ours = false
-		var current_group = player_group if turn_manager == Player.HUMAN else ai_group
-		
+	# Turn Continuation
+	var continue_turn = false
+	if not foul_committed and not balls_potted_this_turn.is_empty():
+		var my_grp = player_group if turn_manager == Player.HUMAN else ai_group
+		var potted_mine = false
 		for b in balls_potted_this_turn:
 			if is_instance_valid(b):
-				if current_group == 0: potted_ours = true # Open table
-				elif current_group == 1 and b.ball_type == PoolBall.BallType.SOLID: potted_ours = true
-				elif current_group == 2 and b.ball_type == PoolBall.BallType.STRIPE: potted_ours = true
-			
-		if potted_ours:
-			turn_continues = true
+				if my_grp == 0: potted_mine = true
+				elif my_grp == 1 and b.ball_type == PoolBall.BallType.SOLID: potted_mine = true
+				elif my_grp == 2 and b.ball_type == PoolBall.BallType.STRIPE: potted_mine = true
+		if potted_mine: continue_turn = true
 	
 	if foul_committed:
 		update_status("FOUL: " + foul_reason)
-		# Ball in Hand
-		if not is_instance_valid(cue_ball):
-			_respawn_cue_ball_memory()
-		current_state = State.PLACING_CUE
-		_switch_turn() # Foul always ends turn
+		if not is_instance_valid(cue_ball): _respawn_cue_memory()
+		_set_state(State.PLACING_CUE)
+		_switch_turn()
+	elif continue_turn:
+		update_status("Go Again!")
+		_set_state(State.AIMING)
 	else:
-		if turn_continues:
-			update_status("Go Again!")
-			current_state = State.AIMING
-		else:
-			_switch_turn()
-			current_state = State.AIMING
+		_switch_turn()
+		_set_state(State.AIMING)
 
 func _switch_turn():
-	turn_manager = Player.AI if turn_manager == Player.HUMAN else Player.HUMAN
-	_update_turn_ui()
+	if game_mode == Player.AI:
+		turn_manager = Player.AI if turn_manager == Player.HUMAN else Player.HUMAN
+	else:
+		# PVP logic (Player 1 vs Player 2) - Reuse HUMAN state but just flip logic mentally
+		turn_manager = Player.HUMAN 
+	
+	update_status("Your Turn" if turn_manager == Player.HUMAN else "AI Turn")
 
 func _game_over(msg):
 	update_status(msg)
-	current_state = State.GAME_OVER
-	await get_tree().create_timer(4.0).timeout
-	reset_game()
-
-func _respawn_cue_ball_memory():
-	cue_ball = _create_ball(Vector2(-100, -100), PoolBall.BallType.CUE, 0)
-	cue_ball.is_stopped = true
-
-func _are_balls_stopped() -> bool:
-	for b in balls_on_table:
-		if is_instance_valid(b) and not b.is_stopped: return false
-	if is_instance_valid(cue_ball) and not cue_ball.is_stopped: return false
-	return true
+	_set_state(State.GAME_OVER)
+	await get_tree().create_timer(3.0).timeout
+	_set_state(State.MENU)
 
 # --------------------------------------------------------------------------
-#   SETUP & BOILERPLATE
+#   SETUP & VISUALS
 # --------------------------------------------------------------------------
-func reset_game():
-	# Cleanup
-	for b in balls_on_table: if is_instance_valid(b): b.queue_free()
-	balls_on_table.clear()
-	if is_instance_valid(cue_ball): cue_ball.queue_free()
-	
-	player_group = 0; ai_group = 0
-	turn_manager = Player.HUMAN
-	
+func start_game(mode):
+	game_mode = mode
+	# Reset logic
+	_clear_table_entities()
 	_spawn_walls()
 	_spawn_pockets()
 	_rack_balls()
 	_spawn_cue_ball()
 	
-	current_state = State.AIMING
+	player_group = 0; ai_group = 0
+	turn_manager = Player.HUMAN
+	
+	_set_state(State.AIMING)
 	_update_group_ui()
-	_update_turn_ui()
 
-func _spawn_cue_ball():
-	cue_ball = _create_ball(Vector2(TABLE_W * 0.25, TABLE_H * 0.5), PoolBall.BallType.CUE, 0)
+func _clear_table_entities():
+	for b in balls_on_table: if is_instance_valid(b): b.queue_free()
+	balls_on_table.clear()
+	if is_instance_valid(cue_ball): cue_ball.queue_free()
+	for c in particle_container.get_children(): c.queue_free()
 
-func _create_ball(pos: Vector2, type: int, num: int) -> RigidBody2D:
-	var b = PoolBall.new()
-	b.position = pos
-	
-	var col_idx = (num - 1) % 7
-	var color = BALL_COLORS[col_idx] if num != 8 else Color.BLACK
-	if type == PoolBall.BallType.CUE: color = Color.WHITE
-	
-	b.setup(num, type, color)
-	
-	var shape = CollisionShape2D.new()
-	var circ = CircleShape2D.new()
-	circ.radius = BALL_R
-	shape.shape = circ
-	b.add_child(shape)
-	
-	# Connect Audio Signal
-	b.collided.connect(_on_ball_collision_report)
-	
-	add_child(b)
-	if type != PoolBall.BallType.CUE:
-		balls_on_table.append(b)
-	return b
-
-func _rack_balls():
-	var start_x = TABLE_W * 0.75
-	var start_y = TABLE_H * 0.5
-	var r = BALL_R
-	var ball_nums = range(1, 16)
-	ball_nums.shuffle()
-	
-	var idx = 0
-	for col in range(5):
-		for row in range(col + 1):
-			var x = start_x + (col * r * 1.732)
-			var y = start_y + (row * r * 2.0) - (col * r)
-			
-			var num = ball_nums[idx]
-			var type = PoolBall.BallType.SOLID
-			if num > 8: type = PoolBall.BallType.STRIPE
-			if num == 8: type = PoolBall.BallType.EIGHT
-			
-			# Force 8 ball to center (row 1, col 2 in 0-indexed triangle)
-			if col == 2 and row == 1:
-				num = 8; type = PoolBall.BallType.EIGHT
-			elif num == 8:
-				num = 1; type = PoolBall.BallType.SOLID # Swap
-				
-			_create_ball(Vector2(x, y), type, num)
-			idx += 1
-			if idx >= 15: return
-
-func _setup_visuals_and_ui():
-	# Cam
-	var cam = Camera2D.new()
-	cam.position = Vector2(TABLE_W/2, TABLE_H/2)
-	add_child(cam)
-	
-	# UI
+func _setup_ui_system():
 	ui_layer = CanvasLayer.new()
 	add_child(ui_layer)
 	
+	# --- MAIN MENU ---
+	menu_control = Control.new()
+	menu_control.set_anchors_preset(Control.PRESET_FULL_RECT)
+	ui_layer.add_child(menu_control)
+	
+	var bg = ColorRect.new()
+	bg.color = Color(0.1, 0.1, 0.1, 0.95)
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_control.add_child(bg)
+	
+	var title = Label.new()
+	title.text = "PRO POOL 2D"
+	title.add_theme_font_size_override("font_size", 64)
+	title.set_anchors_preset(Control.PRESET_TOP_WIDE)
+	title.position.y = 150
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	menu_control.add_child(title)
+	
+	var btn_vbox = VBoxContainer.new()
+	btn_vbox.set_anchors_preset(Control.PRESET_CENTER)
+	btn_vbox.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	btn_vbox.grow_vertical = Control.GROW_DIRECTION_BOTH
+	btn_vbox.custom_minimum_size = Vector2(200, 200)
+	menu_control.add_child(btn_vbox)
+	
+	var btn_ai = Button.new()
+	btn_ai.text = "Play vs AI"
+	btn_ai.custom_minimum_size = Vector2(0, 50)
+	btn_ai.pressed.connect(func(): start_game(Player.AI))
+	btn_vbox.add_child(btn_ai)
+	
+	var btn_pvp = Button.new()
+	btn_pvp.text = "Play PvP (Local)"
+	btn_pvp.custom_minimum_size = Vector2(0, 50)
+	btn_pvp.pressed.connect(func(): start_game(Player.HUMAN))
+	btn_vbox.add_child(btn_pvp)
+	
+	# --- HUD ---
+	hud_control = Control.new()
+	hud_control.set_anchors_preset(Control.PRESET_FULL_RECT)
+	hud_control.visible = false
+	# CRITICAL FIX: Allow clicks to pass through empty space in HUD
+	hud_control.mouse_filter = Control.MOUSE_FILTER_IGNORE 
+	ui_layer.add_child(hud_control)
+	
+	var top_bar = ColorRect.new()
+	top_bar.color = Color(0, 0, 0, 0.5)
+	top_bar.size = Vector2(1280, 60)
+	# But stop clicks on the bar itself so we don't shoot while clicking menu
+	top_bar.mouse_filter = Control.MOUSE_FILTER_STOP
+	hud_control.add_child(top_bar)
+	
 	status_label = Label.new()
-	status_label.position = Vector2(0, 20)
-	status_label.size = Vector2(1280, 50)
+	status_label.text = "Ready"
 	status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	status_label.add_theme_font_size_override("font_size", 32)
-	ui_layer.add_child(status_label)
+	status_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	status_label.size = Vector2(1280, 60)
+	status_label.add_theme_font_size_override("font_size", 28)
+	hud_control.add_child(status_label)
 	
 	group_label = Label.new()
-	group_label.position = Vector2(20, 20)
-	group_label.add_theme_font_size_override("font_size", 24)
-	ui_layer.add_child(group_label)
+	group_label.text = "Table Open"
+	group_label.position = Vector2(20, 15)
+	hud_control.add_child(group_label)
+	
+	var btn_reset = Button.new()
+	btn_reset.text = "Menu"
+	btn_reset.position = Vector2(1200, 10)
+	btn_reset.size = Vector2(70, 40)
+	btn_reset.pressed.connect(func(): _set_state(State.MENU))
+	hud_control.add_child(btn_reset)
+
+func update_status(text):
+	status_label.text = text
 
 func _update_group_ui():
 	var txt = "Table: Open"
-	if player_group == 1: txt = "You: SOLIDS | AI: STRIPES"
-	elif player_group == 2: txt = "You: STRIPES | AI: SOLIDS"
+	if player_group == 1: txt = "You: SOLIDS"
+	elif player_group == 2: txt = "You: STRIPES"
 	group_label.text = txt
 
-func _update_turn_ui():
-	status_label.text = "Your Turn" if turn_manager == Player.HUMAN else "AI Turn"
-
-func update_status(text: String):
-	status_label.text = text
-
+# --------------------------------------------------------------------------
+#   DRAWING
+# --------------------------------------------------------------------------
 func _draw():
-	# Floor
+	if current_state == State.MENU: return
+	
+	# Background
 	draw_rect(Rect2(-1000, -1000, 3000, 3000), Color(0.12, 0.12, 0.14))
-	# Table
+	
+	# Table Wood
 	draw_rect(Rect2(-RAIL_WIDTH, -RAIL_WIDTH, TABLE_W+RAIL_WIDTH*2, TABLE_H+RAIL_WIDTH*2), COL_WOOD)
+	# Inner Dark Trim
+	draw_rect(Rect2(-5, -5, TABLE_W+10, TABLE_H+10), COL_WOOD_DARK, false, 10.0)
+	# Felt
 	draw_rect(Rect2(0,0,TABLE_W, TABLE_H), COL_FELT)
 	
-	# Aim Lines
+	# Simple Diamonds/Markers
+	for i in range(1, 4):
+		draw_circle(Vector2(TABLE_W * (i/4.0), -RAIL_WIDTH/2), 3, Color.WHITE)
+		draw_circle(Vector2(TABLE_W * (i/4.0), TABLE_H + RAIL_WIDTH/2), 3, Color.WHITE)
+	
+	# Aim Guide
 	if current_state == State.AIMING and is_dragging and is_instance_valid(cue_ball):
 		var start = cue_ball.position
-		var power = aim_vector.length() / MAX_DRAG_DIST
+		var pwr = aim_vector.length() / MAX_DRAG_DIST
+		var dir = aim_vector.normalized()
 		
-		# Guide Line
-		draw_line(start, start + aim_vector.normalized() * 500, Color(1,1,1,0.2), 2.0)
+		# Line
+		var line_end = start + dir * 800
+		if ghost_ball_pos != Vector2.INF:
+			line_end = ghost_ball_pos
+			# Ghost Ball
+			draw_circle(ghost_ball_pos, BALL_R, Color(1, 1, 1, 0.4))
+			draw_circle(ghost_ball_pos, BALL_R, Color.BLACK, false, 1.0)
+			# Trajectory
+			draw_line(ghost_ball_pos, ghost_ball_pos + ghost_target_path, Color(1,1,1,0.6), 2.0)
+		
+		draw_line(start, line_end, Color(1,1,1,0.2), 2.0)
 		
 		# Cue Stick
-		var stick_dir = -aim_vector.normalized()
-		var stick_pos = start + stick_dir * (25 + power * 60)
-		draw_line(stick_pos, stick_pos + stick_dir * 300, Color(0.9, 0.8, 0.6), 8.0)
-		draw_line(stick_pos, stick_pos + stick_dir * 10, Color.BLUE, 8.0)
+		var stick_start = start - dir * (30 + pwr * 80)
+		var stick_end = stick_start - dir * 300
+		draw_line(stick_start, stick_end, Color(0.9, 0.8, 0.6), 8.0)
+		draw_line(stick_start, stick_start - dir * 10, Color.BLUE, 8.0)
+		
+		# Power Arc
+		var color = Color.GREEN.lerp(Color.RED, pwr)
+		draw_arc(start, 40, -PI/2, -PI/2 + (pwr * TAU), 32, color, 4.0)
 
-func _setup_physics_world():
-	walls = StaticBody2D.new()
-	var mat = PhysicsMaterial.new()
-	mat.bounce = 0.6; mat.friction = 0.1
-	walls.physics_material_override = mat
-	add_child(walls)
+# --------------------------------------------------------------------------
+#   AUDIO / PARTICLES
+# --------------------------------------------------------------------------
+func _setup_audio():
+	audio_player = AudioStreamPlayer.new()
+	var gen = AudioStreamGenerator.new()
+	gen.mix_rate = SAMPLE_HZ; gen.buffer_length = 0.1
+	audio_player.stream = gen
+	add_child(audio_player)
+	audio_player.play()
+	audio_playback = audio_player.get_stream_playback()
+
+func play_clack_sound(intensity):
+	if not audio_playback: return
+	var vol = clamp(intensity / 800.0, 0.1, 1.0)
+	var frames = int(SAMPLE_HZ * 0.05)
+	if audio_playback.get_frames_available() < frames: return
+	var buf = PackedVector2Array()
+	buf.resize(frames)
+	for i in range(frames):
+		var t = float(i)/frames
+		var val = (sin(t*50.0)*0.5 + randf_range(-1,1)*0.5) * exp(-10*t) * vol
+		buf[i] = Vector2(val, val)
+	audio_playback.push_buffer(buf)
+
+func spawn_particles(intensity, pos):
+	if intensity < 100: return
+	var p = CPUParticles2D.new()
+	p.position = pos; p.emitting = true; p.one_shot = true
+	p.lifetime = 0.5; p.explosiveness = 1.0; p.amount = 12
+	p.spread = 180; p.initial_velocity_min = 20; p.initial_velocity_max = 100
+	p.scale_amount_max = 3.0; p.color = Color(0.9, 0.9, 1.0, 0.6)
+	particle_container.add_child(p)
+	await get_tree().create_timer(1.0).timeout
+	p.queue_free()
+
+# --------------------------------------------------------------------------
+#   BOILERPLATE SPAWNERS
+# --------------------------------------------------------------------------
+func _spawn_cue_ball():
+	cue_ball = _create_ball(Vector2(TABLE_W * 0.25, TABLE_H * 0.5), PoolBall.BallType.CUE, 0)
+
+func _respawn_cue_memory():
+	cue_ball = _create_ball(Vector2(-100,-100), PoolBall.BallType.CUE, 0)
+	cue_ball.is_stopped = true
+
+func _create_ball(pos, type, num):
+	var b = PoolBall.new()
+	b.position = pos
+	var col_idx = (num - 1) % 7
+	var c = BALL_COLORS[col_idx] if num != 8 else Color.BLACK
+	if type == PoolBall.BallType.CUE: c = Color.WHITE
+	b.setup(num, type, c)
+	var shape = CollisionShape2D.new(); var circ = CircleShape2D.new(); circ.radius = BALL_R
+	shape.shape = circ; b.add_child(shape)
+	b.collided.connect(_on_ball_collision)
+	add_child(b)
+	if type != PoolBall.BallType.CUE: balls_on_table.append(b)
+	return b
 
 func _spawn_walls():
-	for c in walls.get_children(): c.queue_free()
+	walls = StaticBody2D.new()
+	var mat = PhysicsMaterial.new(); mat.bounce = 0.6; mat.friction = 0.1
+	walls.physics_material_override = mat; add_child(walls)
 	var polys = [
 		[Vector2(-RAIL_WIDTH, -RAIL_WIDTH), Vector2(TABLE_W+RAIL_WIDTH, -RAIL_WIDTH), Vector2(TABLE_W, 0), Vector2(0,0)],
 		[Vector2(TABLE_W, 0), Vector2(TABLE_W+RAIL_WIDTH, -RAIL_WIDTH), Vector2(TABLE_W+RAIL_WIDTH, TABLE_H+RAIL_WIDTH), Vector2(TABLE_W, TABLE_H)],
 		[Vector2(0, TABLE_H), Vector2(TABLE_W, TABLE_H), Vector2(TABLE_W+RAIL_WIDTH, TABLE_H+RAIL_WIDTH), Vector2(-RAIL_WIDTH, TABLE_H+RAIL_WIDTH)],
 		[Vector2(-RAIL_WIDTH, -RAIL_WIDTH), Vector2(0,0), Vector2(0, TABLE_H), Vector2(-RAIL_WIDTH, TABLE_H+RAIL_WIDTH)]
 	]
-	for p in polys:
-		var col = CollisionPolygon2D.new()
-		col.polygon = PackedVector2Array(p)
-		walls.add_child(col)
+	for p in polys: var c = CollisionPolygon2D.new(); c.polygon = PackedVector2Array(p); walls.add_child(c)
 
 func _spawn_pockets():
 	pockets.clear()
 	for c in get_children(): if c is Pocket: c.queue_free()
 	var locs = [Vector2(0,0), Vector2(TABLE_W/2, -5), Vector2(TABLE_W, 0), Vector2(0, TABLE_H), Vector2(TABLE_W/2, TABLE_H+5), Vector2(TABLE_W, TABLE_H)]
 	for pos in locs:
-		var p = Pocket.new()
-		p.position = pos
-		add_child(p)
-		p.configure(POCKET_R)
-		p.ball_potted.connect(_on_pocket_ball)
-		pockets.append(p)
+		var p = Pocket.new(); p.position = pos; add_child(p); p.configure(POCKET_R)
+		p.ball_potted.connect(_on_pocket_ball); pockets.append(p)
+
+func _rack_balls():
+	var start_x = TABLE_W * 0.75; var start_y = TABLE_H * 0.5; var r = BALL_R
+	var ball_nums = range(1, 16); ball_nums.shuffle(); var idx = 0
+	for col in range(5):
+		for row in range(col + 1):
+			var x = start_x + (col * r * 1.732); var y = start_y + (row * r * 2.0) - (col * r)
+			var num = ball_nums[idx]; var type = PoolBall.BallType.SOLID
+			if num > 8: type = PoolBall.BallType.STRIPE
+			if num == 8: type = PoolBall.BallType.EIGHT
+			if col == 2 and row == 1: num = 8; type = PoolBall.BallType.EIGHT
+			elif num == 8: num = 1; type = PoolBall.BallType.SOLID 
+			_create_ball(Vector2(x, y), type, num); idx += 1
+			if idx >= 15: return
+
+func _setup_physics_world():
+	# Empty placeholder - physics world is handled by Godot automatically
+	pass
+
+func _are_balls_stopped() -> bool:
+	# Check if all balls are stopped
+	for b in balls_on_table:
+		if is_instance_valid(b) and not b.is_stopped:
+			return false
+	if is_instance_valid(cue_ball) and not cue_ball.is_stopped:
+		return false
+	return true
