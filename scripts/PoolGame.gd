@@ -14,9 +14,10 @@ const COL_FELT = Color(0.0, 0.5, 0.35)
 const COL_FELT_DARK = Color(0.0, 0.45, 0.32)
 const COL_WOOD = Color(0.35, 0.2, 0.1)
 const COL_WOOD_DARK = Color(0.25, 0.15, 0.05)
+# Standard Pool Colors: 1-Yellow, 2-Blue, 3-Red, 4-Purple, 5-Orange, 6-Green, 7-Maroon
 const BALL_COLORS = [
 	Color.YELLOW, Color.BLUE, Color.RED, Color.PURPLE, 
-	Color.ORANGE, Color.GREEN, Color.MAROON
+	Color(1, 0.5, 0), Color.GREEN, Color(0.5, 0, 0)
 ]
 
 # --- State Machine ---
@@ -25,10 +26,10 @@ var current_state = State.MENU
 
 enum Player { HUMAN, AI }
 var turn_manager = Player.HUMAN
-var game_mode = Player.AI # Who is the opponent?
+var game_mode = Player.AI
 
 # --- Rules State ---
-var player_group: int = 0 
+var player_group: int = 0  # 0: Open, 1: Solids, 2: Stripes
 var ai_group: int = 0
 var balls_potted_this_turn: Array = []
 var foul_committed: bool = false
@@ -86,33 +87,31 @@ func _process(delta):
 	
 	match current_state:
 		State.MENU:
-			pass # Waiting for UI input
-			
+			pass 
 		State.AIMING:
 			if turn_manager == Player.HUMAN:
 				_handle_human_aiming()
 			elif game_mode == Player.AI:
 				_run_ai_turn()
-				
 		State.PLACING_CUE:
 			_handle_cue_placement()
-
 		State.WAITING_FOR_STOP:
 			if _are_balls_stopped():
 				_end_turn_logic()
 
 func _set_state(new_state):
 	current_state = new_state
-	# UI Visibility Toggle
 	menu_control.visible = (new_state == State.MENU)
 	hud_control.visible = (new_state != State.MENU)
 	
 	if new_state == State.MENU:
-		# Clear table visual
 		_clear_table_entities()
 	
 	if new_state == State.AIMING:
-		update_status("Your Turn" if turn_manager == Player.HUMAN else "Opponent Thinking...")
+		var p_name = "Your Turn" if turn_manager == Player.HUMAN else "AI Turn"
+		if game_mode == Player.HUMAN:
+			p_name = "Player 1" if turn_manager == Player.HUMAN else "Player 2"
+		update_status(p_name)
 
 # --------------------------------------------------------------------------
 #   CAMERA SHAKE
@@ -123,7 +122,6 @@ func _setup_camera():
 	add_child(camera)
 
 func apply_shake(intensity: float):
-	# Map intensity (0-2000) to shake amount (0-15 pixels)
 	shake_strength = clamp(intensity * 0.015, 0.0, 20.0)
 
 func _process_camera_shake(delta):
@@ -140,7 +138,6 @@ func _process_camera_shake(delta):
 func _handle_human_aiming():
 	if not is_instance_valid(cue_ball): return
 	
-	# Ghost Ball Logic
 	ghost_ball_pos = Vector2.INF
 	ghost_target_path = Vector2.ZERO
 	
@@ -150,18 +147,29 @@ func _handle_human_aiming():
 		var start = cue_ball.position
 		var end = start + dir * 2000.0
 		
-		var query = PhysicsRayQueryParameters2D.create(start, end)
+		# Sphere Trace instead of Ray Trace for better accuracy
+		var query = PhysicsShapeQueryParameters2D.new()
+		var shape = CircleShape2D.new()
+		shape.radius = BALL_R * 0.9 # Slightly smaller to avoid self-collision issues
+		query.shape = shape
+		query.transform = Transform2D(0, start)
+		query.motion = (end - start)
 		query.exclude = [cue_ball.get_rid()]
-		var result = space.intersect_ray(query)
+		
+		var result = space.intersect_shape(query, 1) # Get first hit
 		
 		if not result.is_empty():
-			var collider = result.collider
-			if collider is PoolBall:
-				# Ghost Ball Position: Hit Position + (Hit Normal * 2 Radius)
-				# Note: result.normal points OUT from the object ball.
-				ghost_ball_pos = collider.position + (result.normal * (BALL_R * 2.0))
-				# Target Trajectory: Opposite of Hit Normal
-				ghost_target_path = -result.normal * 150.0
+			# Logic for SphereCast is different. We approximate hit point.
+			# Revert to RayCast for the visual line interaction point to be simple
+			var ray_q = PhysicsRayQueryParameters2D.create(start, end)
+			ray_q.exclude = [cue_ball.get_rid()]
+			var ray_res = space.intersect_ray(ray_q)
+			
+			if not ray_res.is_empty():
+				var collider = ray_res.collider
+				if collider is PoolBall:
+					ghost_ball_pos = collider.position + (ray_res.normal * (BALL_R * 2.0))
+					ghost_target_path = -ray_res.normal * 150.0
 
 func _handle_cue_placement():
 	if not is_instance_valid(cue_ball): return
@@ -172,6 +180,7 @@ func _handle_cue_placement():
 	cue_ball.position.x = clamp(cue_ball.position.x, margin, TABLE_W - margin)
 	cue_ball.position.y = clamp(cue_ball.position.y, margin, TABLE_H - margin)
 	
+	# Kitchen rule (behind headstring) is standard, but ignoring for arcade fun
 	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		_set_state(State.AIMING)
 		update_status("Placed. Drag to shoot.")
@@ -199,12 +208,11 @@ func _execute_shot(vector: Vector2):
 	var power_ratio = vector.length() / MAX_DRAG_DIST
 	var impulse = vector.normalized() * (power_ratio * MAX_POWER)
 	
-	cue_ball.sleeping = false
-	cue_ball.apply_central_impulse(impulse)
+	# Call launch on the ball to handle physics activation properly
+	cue_ball.launch(impulse)
 	
 	play_clack_sound(MAX_POWER * power_ratio * 0.6)
 	apply_shake(MAX_POWER * power_ratio)
-	spawn_particles(100.0, cue_ball.position)
 	
 	balls_potted_this_turn.clear()
 	foul_committed = false
@@ -223,65 +231,86 @@ func _run_ai_turn():
 	
 	await get_tree().create_timer(1.0).timeout
 	
-	# Simple AI Implementation
 	var targets = []
 	for b in balls_on_table:
 		if b == cue_ball: continue
 		if _is_ball_legal_target(b): targets.append(b)
 	
-	if targets.is_empty(): # Fallback
+	# Fallback if no legal targets (or only 8 ball left but blocked)
+	if targets.is_empty(): 
 		for b in balls_on_table: if b != cue_ball: targets.append(b)
 	
 	var best_shot = Vector2.ZERO
-	var best_score = -9999.0
+	var best_score = -99999.0
 	
 	for target in targets:
 		for pocket in pockets:
-			# Raycast Check Target -> Pocket
-			if not _raycast_clear(target.position, pocket.position, [target, cue_ball]): continue
+			# 1. Can Target reach Pocket?
+			if not _shapecast_clear(target.position, pocket.position, [target, cue_ball]): continue
 			
 			var to_pocket = pocket.position - target.position
 			var aim_dir = to_pocket.normalized()
 			var ghost_pos = target.position - (aim_dir * (BALL_R * 2.0))
 			
-			# Raycast Check Cue -> Ghost
-			if not _raycast_clear(cue_ball.position, ghost_pos, [cue_ball, target]): continue
+			# 2. Can Cue reach Ghost Position?
+			if not _shapecast_clear(cue_ball.position, ghost_pos, [cue_ball, target]): continue
 			
 			var shot_vec = ghost_pos - cue_ball.position
-			var score = -shot_vec.length() - (abs(shot_vec.angle_to(aim_dir)) * 600.0)
+			
+			# Score Calculation
+			# Distance penalty
+			var score = -shot_vec.length() 
+			# Angle penalty (cut shots are harder)
+			var cut_angle = abs(shot_vec.angle_to(aim_dir))
+			score -= cut_angle * 1000.0
 			
 			if score > best_score:
 				best_score = score
 				best_shot = shot_vec
 	
 	if best_shot == Vector2.ZERO:
-		best_shot = Vector2(randf()-0.5, randf()-0.5) * 100.0
+		# Just hit something hard
+		best_shot = Vector2(randf()-0.5, randf()-0.5).normalized() * 100.0
 	else:
-		# Add AI Error/Noise
+		# Add AI Noise
 		best_shot = best_shot.rotated(randf_range(-0.02, 0.02))
-		var pwr = best_shot.length() + 250.0
+		var pwr = best_shot.length() + 300.0
 		best_shot = best_shot.normalized() * min(pwr, MAX_DRAG_DIST)
 	
 	_execute_shot(best_shot)
 
-func _raycast_clear(from, to, exclude):
+func _shapecast_clear(from: Vector2, to: Vector2, exclude: Array) -> bool:
 	var space = get_world_2d().direct_space_state
-	var query = PhysicsRayQueryParameters2D.create(from, to)
-	var rids = []
-	for x in exclude: if is_instance_valid(x): rids.append(x.get_rid())
-	query.exclude = rids
-	return space.intersect_ray(query).is_empty()
+	var query = PhysicsShapeQueryParameters2D.new()
+	var shape = CircleShape2D.new()
+	shape.radius = BALL_R # Full width check
+	query.shape = shape
+	query.transform = Transform2D(0, from)
+	query.motion = to - from
+	
+	var ex_rids = []
+	for x in exclude: if is_instance_valid(x): ex_rids.append(x.get_rid())
+	query.exclude = ex_rids
+	
+	var result = space.intersect_shape(query)
+	return result.is_empty()
 
 func _is_ball_legal_target(ball):
-	# Simplified 8-ball logic
-	if ai_group == 0: return ball.ball_type != PoolBall.BallType.EIGHT
-	var target_type = PoolBall.BallType.SOLID if ai_group == 1 else PoolBall.BallType.STRIPE
+	var my_group = ai_group if turn_manager == Player.AI else player_group
 	
-	var has_balls = false
+	if my_group == 0: 
+		return ball.ball_type != PoolBall.BallType.EIGHT
+	
+	var target_type = PoolBall.BallType.SOLID if my_group == 1 else PoolBall.BallType.STRIPE
+	
+	var has_legal_balls = false
 	for b in balls_on_table:
-		if b.ball_type == target_type: has_balls = true
+		if b.ball_type == target_type: has_legal_balls = true
 	
-	return ball.ball_type == target_type if has_balls else ball.ball_type == PoolBall.BallType.EIGHT
+	if has_legal_balls:
+		return ball.ball_type == target_type
+	else:
+		return ball.ball_type == PoolBall.BallType.EIGHT
 
 # --------------------------------------------------------------------------
 #   RULES ENGINE
@@ -305,24 +334,51 @@ func _on_pocket_ball(ball):
 		ball.queue_free()
 
 func _end_turn_logic():
-	# Win/Loss Check
-	var eight = false
+	# 1. Check Win/Loss (8 Ball)
+	var potted_eight = false
 	for b in balls_potted_this_turn:
-		if is_instance_valid(b) and b.ball_type == PoolBall.BallType.EIGHT: eight = true
+		if is_instance_valid(b) and b.ball_type == PoolBall.BallType.EIGHT: potted_eight = true
 	
-	if eight:
-		if foul_committed: _game_over("LOSS! 8-Ball Foul.")
-		else: _game_over("WINNER!")
+	if potted_eight:
+		if foul_committed: 
+			_game_over("LOSS! Scratched on 8-Ball.")
+		else:
+			# Check if cleared group
+			var my_grp = player_group if turn_manager == Player.HUMAN else ai_group
+			var remaining_mine = false
+			var target_type = PoolBall.BallType.SOLID if my_grp == 1 else PoolBall.BallType.STRIPE
+			if my_grp != 0:
+				for b in balls_on_table:
+					if b.ball_type == target_type: remaining_mine = true
+			
+			if remaining_mine:
+				_game_over("LOSS! 8-Ball Early.")
+			else:
+				_game_over("WINNER!")
 		return
 
-	if not is_instance_valid(cue_ball): foul_committed = true
+	# 2. Check Cue Ball Validity
+	if not is_instance_valid(cue_ball): 
+		foul_committed = true # Redundant check, but safe
+		foul_reason = "Scratch"
+	else:
+		# Check First Contact Rule
+		var first_hit = cue_ball.first_collision_body
+		if first_hit == null:
+			# Hit nothing
+			foul_committed = true
+			foul_reason = "Hit Nothing"
+		elif first_hit is PoolBall:
+			# Check if legal ball
+			if not _is_ball_legal_target(first_hit):
+				foul_committed = true
+				foul_reason = "Wrong Ball First"
 	
-	# Group Assignment
+	# 3. Assign Groups if Open
 	if player_group == 0 and not foul_committed and not balls_potted_this_turn.is_empty():
 		var first = balls_potted_this_turn[0]
-		if is_instance_valid(first):
+		if is_instance_valid(first) and first.ball_type != PoolBall.BallType.EIGHT:
 			var is_solid = (first.ball_type == PoolBall.BallType.SOLID)
-			# If Human shot, assign what they hit
 			if turn_manager == Player.HUMAN:
 				player_group = 1 if is_solid else 2
 				ai_group = 2 if is_solid else 1
@@ -331,7 +387,7 @@ func _end_turn_logic():
 				player_group = 2 if is_solid else 1
 			_update_group_ui()
 
-	# Turn Continuation
+	# 4. Turn Continuation Logic
 	var continue_turn = false
 	if not foul_committed and not balls_potted_this_turn.is_empty():
 		var my_grp = player_group if turn_manager == Player.HUMAN else ai_group
@@ -341,6 +397,7 @@ func _end_turn_logic():
 				if my_grp == 0: potted_mine = true
 				elif my_grp == 1 and b.ball_type == PoolBall.BallType.SOLID: potted_mine = true
 				elif my_grp == 2 and b.ball_type == PoolBall.BallType.STRIPE: potted_mine = true
+		
 		if potted_mine: continue_turn = true
 	
 	if foul_committed:
@@ -359,15 +416,22 @@ func _switch_turn():
 	if game_mode == Player.AI:
 		turn_manager = Player.AI if turn_manager == Player.HUMAN else Player.HUMAN
 	else:
-		# PVP logic (Player 1 vs Player 2) - Reuse HUMAN state but just flip logic mentally
+		# PVP: Just flip the visual label, logic stays HUMAN
 		turn_manager = Player.HUMAN 
+		# In a real PVP, you'd track Player 1 vs Player 2 ID variables here
+		# But for this codebase, we just flip the group UI logic visually
+		var temp = player_group
+		player_group = ai_group
+		ai_group = temp
 	
-	update_status("Your Turn" if turn_manager == Player.HUMAN else "AI Turn")
+	_update_group_ui()
+	var p_name = "Your Turn" if turn_manager == Player.HUMAN else "AI Turn"
+	update_status(p_name)
 
 func _game_over(msg):
 	update_status(msg)
 	_set_state(State.GAME_OVER)
-	await get_tree().create_timer(3.0).timeout
+	await get_tree().create_timer(4.0).timeout
 	_set_state(State.MENU)
 
 # --------------------------------------------------------------------------
@@ -375,7 +439,6 @@ func _game_over(msg):
 # --------------------------------------------------------------------------
 func start_game(mode):
 	game_mode = mode
-	# Reset logic
 	_clear_table_entities()
 	_spawn_walls()
 	_spawn_pockets()
@@ -393,6 +456,8 @@ func _clear_table_entities():
 	balls_on_table.clear()
 	if is_instance_valid(cue_ball): cue_ball.queue_free()
 	for c in particle_container.get_children(): c.queue_free()
+	# Clean walls too to reset geometry
+	if is_instance_valid(walls): walls.queue_free()
 
 func _setup_ui_system():
 	ui_layer = CanvasLayer.new()
@@ -439,14 +504,12 @@ func _setup_ui_system():
 	hud_control = Control.new()
 	hud_control.set_anchors_preset(Control.PRESET_FULL_RECT)
 	hud_control.visible = false
-	# CRITICAL FIX: Allow clicks to pass through empty space in HUD
 	hud_control.mouse_filter = Control.MOUSE_FILTER_IGNORE 
 	ui_layer.add_child(hud_control)
 	
 	var top_bar = ColorRect.new()
 	top_bar.color = Color(0, 0, 0, 0.5)
 	top_bar.size = Vector2(1280, 60)
-	# But stop clicks on the bar itself so we don't shoot while clicking menu
 	top_bar.mouse_filter = Control.MOUSE_FILTER_STOP
 	hud_control.add_child(top_bar)
 	
@@ -495,7 +558,7 @@ func _draw():
 	# Felt
 	draw_rect(Rect2(0,0,TABLE_W, TABLE_H), COL_FELT)
 	
-	# Simple Diamonds/Markers
+	# Markers
 	for i in range(1, 4):
 		draw_circle(Vector2(TABLE_W * (i/4.0), -RAIL_WIDTH/2), 3, Color.WHITE)
 		draw_circle(Vector2(TABLE_W * (i/4.0), TABLE_H + RAIL_WIDTH/2), 3, Color.WHITE)
@@ -510,10 +573,7 @@ func _draw():
 		var line_end = start + dir * 800
 		if ghost_ball_pos != Vector2.INF:
 			line_end = ghost_ball_pos
-			# Ghost Ball
 			draw_circle(ghost_ball_pos, BALL_R, Color(1, 1, 1, 0.4))
-			draw_circle(ghost_ball_pos, BALL_R, Color.BLACK, false, 1.0)
-			# Trajectory
 			draw_line(ghost_ball_pos, ghost_ball_pos + ghost_target_path, Color(1,1,1,0.6), 2.0)
 		
 		draw_line(start, line_end, Color(1,1,1,0.2), 2.0)
@@ -591,46 +651,91 @@ func _create_ball(pos, type, num):
 func _spawn_walls():
 	walls = StaticBody2D.new()
 	var mat = PhysicsMaterial.new(); mat.bounce = 0.6; mat.friction = 0.1
-	walls.physics_material_override = mat; add_child(walls)
-	var polys = [
-		[Vector2(-RAIL_WIDTH, -RAIL_WIDTH), Vector2(TABLE_W+RAIL_WIDTH, -RAIL_WIDTH), Vector2(TABLE_W, 0), Vector2(0,0)],
-		[Vector2(TABLE_W, 0), Vector2(TABLE_W+RAIL_WIDTH, -RAIL_WIDTH), Vector2(TABLE_W+RAIL_WIDTH, TABLE_H+RAIL_WIDTH), Vector2(TABLE_W, TABLE_H)],
-		[Vector2(0, TABLE_H), Vector2(TABLE_W, TABLE_H), Vector2(TABLE_W+RAIL_WIDTH, TABLE_H+RAIL_WIDTH), Vector2(-RAIL_WIDTH, TABLE_H+RAIL_WIDTH)],
-		[Vector2(-RAIL_WIDTH, -RAIL_WIDTH), Vector2(0,0), Vector2(0, TABLE_H), Vector2(-RAIL_WIDTH, TABLE_H+RAIL_WIDTH)]
-	]
-	for p in polys: var c = CollisionPolygon2D.new(); c.polygon = PackedVector2Array(p); walls.add_child(c)
+	walls.physics_material_override = mat
+	add_child(walls)
+	
+	# Updated Geometry: Cutout corners for pockets
+	var rw = RAIL_WIDTH
+	var w = TABLE_W
+	var h = TABLE_H
+	var c = 25.0 # Corner cutout size
+	
+	# Top Wall
+	var p_top = PackedVector2Array([
+		Vector2(-rw, -rw), Vector2(w+rw, -rw), 
+		Vector2(w-c, 0), Vector2(w/2 + c, 0), Vector2(w/2, -c), Vector2(w/2 - c, 0), Vector2(c, 0)
+	])
+	_add_poly(walls, p_top)
+	
+	# Bottom Wall
+	var p_bot = PackedVector2Array([
+		Vector2(-rw, h+rw), Vector2(w+rw, h+rw),
+		Vector2(w-c, h), Vector2(w/2 + c, h), Vector2(w/2, h+c), Vector2(w/2 - c, h), Vector2(c, h)
+	])
+	_add_poly(walls, p_bot)
+	
+	# Left Wall
+	var p_left = PackedVector2Array([
+		Vector2(-rw, -rw), Vector2(0, c), Vector2(0, h-c), Vector2(-rw, h+rw)
+	])
+	_add_poly(walls, p_left)
+	
+	# Right Wall
+	var p_right = PackedVector2Array([
+		Vector2(w+rw, -rw), Vector2(w, c), Vector2(w, h-c), Vector2(w+rw, h+rw)
+	])
+	_add_poly(walls, p_right)
+
+func _add_poly(node, points):
+	var c = CollisionPolygon2D.new()
+	c.polygon = points
+	node.add_child(c)
 
 func _spawn_pockets():
 	pockets.clear()
 	for c in get_children(): if c is Pocket: c.queue_free()
-	var locs = [Vector2(0,0), Vector2(TABLE_W/2, -5), Vector2(TABLE_W, 0), Vector2(0, TABLE_H), Vector2(TABLE_W/2, TABLE_H+5), Vector2(TABLE_W, TABLE_H)]
+	# Positions slightly adjusted for new wall geometry
+	var locs = [Vector2(0,0), Vector2(TABLE_W/2, -8), Vector2(TABLE_W, 0), Vector2(0, TABLE_H), Vector2(TABLE_W/2, TABLE_H+8), Vector2(TABLE_W, TABLE_H)]
 	for pos in locs:
 		var p = Pocket.new(); p.position = pos; add_child(p); p.configure(POCKET_R)
 		p.ball_potted.connect(_on_pocket_ball); pockets.append(p)
 
 func _rack_balls():
-	var start_x = TABLE_W * 0.75; var start_y = TABLE_H * 0.5; var r = BALL_R
-	var ball_nums = range(1, 16); ball_nums.shuffle(); var idx = 0
+	var start_x = TABLE_W * 0.75
+	var start_y = TABLE_H * 0.5
+	var r = BALL_R
+	
+	# Logic Fix: Proper 8-ball racking
+	var nums = []
+	for i in range(1, 16): if i != 8: nums.append(i)
+	nums.shuffle()
+	
+	# Insert 8 at index 4 (center of rack)
+	nums.insert(4, 8)
+	
+	# Optional: Enforce corner types (Solid/Stripe on bottom corners)
+	# Bottom corners are index 10 and 14 in a row-by-row fill
+	# This simple shuffle is usually "good enough" for casual play
+	
+	var idx = 0
 	for col in range(5):
 		for row in range(col + 1):
-			var x = start_x + (col * r * 1.732); var y = start_y + (row * r * 2.0) - (col * r)
-			var num = ball_nums[idx]; var type = PoolBall.BallType.SOLID
+			var x = start_x + (col * r * 1.732)
+			var y = start_y + (row * r * 2.0) - (col * r)
+			
+			var num = nums[idx]
+			var type = PoolBall.BallType.SOLID
 			if num > 8: type = PoolBall.BallType.STRIPE
 			if num == 8: type = PoolBall.BallType.EIGHT
-			if col == 2 and row == 1: num = 8; type = PoolBall.BallType.EIGHT
-			elif num == 8: num = 1; type = PoolBall.BallType.SOLID 
-			_create_ball(Vector2(x, y), type, num); idx += 1
-			if idx >= 15: return
+			
+			_create_ball(Vector2(x, y), type, num)
+			idx += 1
 
 func _setup_physics_world():
-	# Empty placeholder - physics world is handled by Godot automatically
 	pass
 
 func _are_balls_stopped() -> bool:
-	# Check if all balls are stopped
 	for b in balls_on_table:
-		if is_instance_valid(b) and not b.is_stopped:
-			return false
-	if is_instance_valid(cue_ball) and not cue_ball.is_stopped:
-		return false
+		if is_instance_valid(b) and not b.is_stopped: return false
+	if is_instance_valid(cue_ball) and not cue_ball.is_stopped: return false
 	return true
